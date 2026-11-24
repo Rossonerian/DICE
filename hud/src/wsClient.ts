@@ -22,8 +22,10 @@ interface EnvShape {
 }
 
 function readEnv(): EnvShape {
-  const meta = import.meta as unknown as { env?: EnvShape };
-  return meta.env ?? {};
+  return {
+    VITE_MOCK_WS: import.meta.env?.VITE_MOCK_WS,
+    VITE_WS_URL: import.meta.env?.VITE_WS_URL,
+  };
 }
 
 const BACKOFF_START_MS = 1000;
