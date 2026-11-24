@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "DICE — Voice & Research Copilot",
+  "version": "0.1.0",
+  "description": "Browser-native multi-agent voice steering, Tab-Architect, and closed Shadow DOM research spotlight.",
+  "permissions": [
+    "sidePanel",
+    "tabs",
+    "activeTab",
+    "scripting",
+    "contextMenus",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Open DICE Assistant"
+  }
+}
