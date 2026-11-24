@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: #0b0f17;
+  overflow: hidden;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color: #e5e7eb;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+mark.spot {
+  background: #fbbf24;
+  color: #111827;
+  padding: 0 3px;
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.55), 0 0 18px 4px rgba(34, 211, 238, 0.55);
+  animation: spotPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes spotPulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.55), 0 0 10px 2px rgba(34, 211, 238, 0.4); }
+  50% { box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.9), 0 0 24px 7px rgba(34, 211, 238, 0.8); }
+}
+
+.card-spot {
+  outline: 2px solid #22d3ee;
+  box-shadow: 0 0 28px rgba(34, 211, 238, 0.35);
+}
+
+@keyframes orbPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.12); }
+}
+.orb-active {
+  animation: orbPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes gateFlash {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.8); }
+  50% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+}
+.gate-flash {
+  animation: gateFlash 1.3s infinite;
+}
+
+/* Narrated / High-Contrast mode */
+.hc,
+.hc body {
+  background: #000;
+}
+.hc .panel {
+  background: #000 !important;
+  border-color: #fff !important;
+  color: #fff !important;
+}
+.hc .muted {
+  color: #e5e7eb !important;
+}
+.hc {
+  font-size: 1.08rem;
+  color: #fff;
+}
+.hc mark.spot {
+  background: #ffff00;
+  color: #000;
+}
