@@ -8,8 +8,15 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup, Comment, Tag
 
+_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
 _HIDDEN_STYLE_RE = re.compile(
-    r"(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?(?:\s*;|\s*$)|font-size\s*:\s*0(?:px|em|rem|%)?(?:\s*;|\s*$))",
+    r"(?:"
+    r"display\s*:\s*none"
+    r"|visibility\s*:\s*(?:hidden|collapse)"
+    r"|opacity\s*:\s*(?:0(?:\.0+)?|\.0+)"
+    r"|font-size\s*:\s*(?:0(?:\.0+)?|\.0+)(?:px|em|rem|pt|pc|ex|ch|vw|vh|vmin|vmax|%)?"
+    r")(?:\s*!\s*important)?(?:\s*;|\s*$)",
     re.IGNORECASE,
 )
 
@@ -60,9 +67,11 @@ def sanitize_html(html: str, max_chars: int = 6000) -> str:
             to_remove.append(tag)
             continue
         style = tag.get("style")
-        if isinstance(style, str) and _HIDDEN_STYLE_RE.search(style):
-            to_remove.append(tag)
-            continue
+        if isinstance(style, str):
+            cleaned_style = _CSS_COMMENT_RE.sub("", style)
+            if _HIDDEN_STYLE_RE.search(cleaned_style):
+                to_remove.append(tag)
+                continue
 
     for tag in to_remove:
         tag.decompose()
@@ -230,6 +239,7 @@ class GateRegistry:
         self._decisions: dict[str, bool] = {}
 
     def create(self, gate_id: str) -> asyncio.Event:
+        self._decisions.pop(gate_id, None)
         event = asyncio.Event()
         self._events[gate_id] = event
         return event
@@ -253,13 +263,13 @@ class GateRegistry:
         self._events.pop(gate_id, None)
         self._decisions.pop(gate_id, None)
 
-    def resolve(self, gate_id: str, approved: bool) -> None:
+    def resolve(self, gate_id: str, approved: bool) -> bool:
         event = self._events.get(gate_id)
-        if event is None:
-            return
-        if gate_id not in self._decisions:
-            self._decisions[gate_id] = approved
+        if event is None or gate_id in self._decisions:
+            return False
+        self._decisions[gate_id] = approved
         event.set()
+        return True
 
     def cancel_all(self) -> None:
         for gate_id, event in list(self._events.items()):
@@ -267,3 +277,4 @@ class GateRegistry:
                 self._decisions[gate_id] = False
             event.set()
         self._events.clear()
+        self._decisions.clear()

@@ -116,11 +116,44 @@ def _is_mock_fetch_enabled(mock_fetch: bool | None) -> bool:
     return os.getenv("MOCK_FETCH", "false").strip().lower() in ("1", "true", "yes")
 
 
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MB cap on fetched HTTP/Playwright bodies
+
+
+def _validate_ip_address(ip_str: str) -> str:
+    """Validate that an IP address is strictly global/public, unwrapping IPv4-mapped IPv6."""
+    ip_clean = ip_str.split("%")[0]
+    ip_obj = ipaddress.ip_address(ip_clean)
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        ip_obj = ip_obj.ipv4_mapped
+        ip_clean = str(ip_obj)
+    if (
+        not ip_obj.is_global
+        or ip_obj.is_multicast
+        or ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    ):
+        raise ValueError(f"Non-global IP address '{ip_clean}' is not permitted")
+    return ip_clean
+
+
+def _is_ip_literal(val: str) -> bool:
+    try:
+        ipaddress.ip_address(val)
+        return True
+    except ValueError:
+        return False
+
+
 def validate_public_https(url: str, mock_fetch: bool | None = None) -> str:
-    """Validate that url uses https and resolves only to global IP addresses."""
+    """Validate that url uses https and resolves only to global IP addresses; return validated IP (or url in mock mode)."""
     parsed = urlparse(url)
     if parsed.scheme.lower() != "https":
         raise ValueError(f"Only https URLs are permitted, got scheme '{parsed.scheme}'")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with embedded credentials are not permitted")
     host = parsed.hostname
     if not host:
         raise ValueError("URL must include a valid hostname")
@@ -136,22 +169,23 @@ def validate_public_https(url: str, mock_fetch: bool | None = None) -> str:
     if not addr_infos:
         raise ValueError(f"No DNS records returned for host '{host}'")
 
+    first_ip: str | None = None
     for info in addr_infos:
-        ip_str = info[4][0]
-        # Strip IPv6 zone index if present
-        ip_clean = ip_str.split("%")[0]
-        ip_obj = ipaddress.ip_address(ip_clean)
-        if not ip_obj.is_global:
-            raise ValueError(f"Non-global IP address '{ip_clean}' is not permitted")
+        validated_ip = _validate_ip_address(info[4][0])
+        if first_ip is None:
+            first_ip = validated_ip
 
-    return url
+    assert first_ip is not None
+    return first_ip
 
 
 async def validate_public_https_async(url: str, mock_fetch: bool | None = None) -> str:
-    """Async version of validate_public_https using the running event loop's getaddrinfo."""
+    """Async version of validate_public_https returning the first validated global IP (or url in mock mode)."""
     parsed = urlparse(url)
     if parsed.scheme.lower() != "https":
         raise ValueError(f"Only https URLs are permitted, got scheme '{parsed.scheme}'")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with embedded credentials are not permitted")
     host = parsed.hostname
     if not host:
         raise ValueError("URL must include a valid hostname")
@@ -168,33 +202,43 @@ async def validate_public_https_async(url: str, mock_fetch: bool | None = None) 
     if not addr_infos:
         raise ValueError(f"No DNS records returned for host '{host}'")
 
+    first_ip: str | None = None
     for info in addr_infos:
-        ip_str = info[4][0]
-        ip_clean = ip_str.split("%")[0]
-        ip_obj = ipaddress.ip_address(ip_clean)
-        if not ip_obj.is_global:
-            raise ValueError(f"Non-global IP address '{ip_clean}' is not permitted")
+        validated_ip = _validate_ip_address(info[4][0])
+        if first_ip is None:
+            first_ip = validated_ip
 
-    return url
+    assert first_ip is not None
+    return first_ip
 
 
 class BrowserPool:
-    """Manages a small pool of Playwright BrowserContexts with safe fallback."""
+    """Manages a small pool of Playwright BrowserContexts with safe fallback and crash recovery."""
 
     def __init__(self) -> None:
         self.available: bool = False
         self.size: int = 0
+        self._enabled: bool = False
         self._playwright: Any = None
         self._browser: Any = None
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._restart_lock: asyncio.Lock = asyncio.Lock()
 
     @property
     def idle(self) -> int:
         return self._queue.qsize()
 
+    def is_healthy(self) -> bool:
+        return (
+            self.available
+            and self._browser is not None
+            and bool(self._browser.is_connected())
+        )
+
     async def start(self, size: int = 2, enabled: bool = True) -> None:
         self.size = max(0, size)
-        if not enabled or self.size == 0:
+        self._enabled = bool(enabled and self.size > 0)
+        if not self._enabled:
             self.available = False
             return
         try:
@@ -207,10 +251,13 @@ class BrowserPool:
                 await self._queue.put(ctx)
             self.available = True
         except Exception:
+            self._enabled = False
             self.available = False
             await self.stop()
 
     async def stop(self) -> None:
+        self._enabled = False
+        self.available = False
         while not self._queue.empty():
             try:
                 ctx = self._queue.get_nowait()
@@ -229,12 +276,73 @@ class BrowserPool:
             except Exception:
                 pass
             self._playwright = None
-        self.available = False
+
+    async def _restart_browser(self) -> None:
+        async with self._restart_lock:
+            if self.is_healthy():
+                return
+            if not self._enabled or self.size == 0:
+                self.available = False
+                return
+            while not self._queue.empty():
+                try:
+                    old_ctx = self._queue.get_nowait()
+                    await asyncio.wait_for(old_ctx.close(), timeout=2.0)
+                except Exception:
+                    pass
+            if self._browser is not None:
+                try:
+                    await asyncio.wait_for(self._browser.close(), timeout=2.0)
+                except Exception:
+                    pass
+                self._browser = None
+            try:
+                if self._playwright is None:
+                    from playwright.async_api import async_playwright
+
+                    self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.launch(headless=True)
+                for _ in range(self.size):
+                    ctx = await self._browser.new_context()
+                    await self._queue.put(ctx)
+                self.available = True
+            except Exception:
+                self.available = False
 
     async def acquire(self, timeout: float = 10.0) -> Any:
-        if not self.available:
+        if not self._enabled or self.size == 0:
             raise RuntimeError("BrowserPool is not available")
-        return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+        if not self.is_healthy():
+            await self._restart_browser()
+        if not self.is_healthy():
+            raise RuntimeError("BrowserPool is not available")
+
+        get_task = asyncio.create_task(self._queue.get())
+        try:
+            ctx = await asyncio.wait_for(get_task, timeout=timeout)
+        except BaseException:
+            if not get_task.done():
+                get_task.cancel()
+                try:
+                    await get_task
+                except BaseException:
+                    pass
+            if get_task.done() and not get_task.cancelled() and get_task.exception() is None:
+                leaked_ctx = get_task.result()
+                if leaked_ctx is not None:
+                    self._queue.put_nowait(leaked_ctx)
+            raise
+
+        if not self.is_healthy():
+            try:
+                await asyncio.wait_for(ctx.close(), timeout=2.0)
+            except BaseException:
+                pass
+            await self._restart_browser()
+            if not self.is_healthy():
+                raise RuntimeError("BrowserPool is not available")
+            ctx = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+        return ctx
 
     async def release(self, ctx: Any) -> None:
         if ctx is None:
@@ -242,22 +350,46 @@ class BrowserPool:
         returned = False
         try:
             for page in list(getattr(ctx, "pages", [])):
-                await page.close()
-            await ctx.clear_cookies()
+                unroute_all = getattr(page, "unroute_all", None)
+                if callable(unroute_all):
+                    try:
+                        await asyncio.wait_for(unroute_all(behavior="ignoreErrors"), timeout=1.0)
+                    except BaseException:
+                        pass
+                await asyncio.wait_for(page.close(), timeout=2.0)
+            await asyncio.wait_for(ctx.clear_cookies(), timeout=2.0)
+            clear_perms = getattr(ctx, "clear_permissions", None)
+            if callable(clear_perms):
+                await asyncio.wait_for(clear_perms(), timeout=2.0)
+            ctx_unroute = getattr(ctx, "unroute_all", None)
+            if callable(ctx_unroute):
+                try:
+                    await asyncio.wait_for(ctx_unroute(behavior="ignoreErrors"), timeout=1.0)
+                except BaseException:
+                    pass
+            if not self.is_healthy():
+                raise RuntimeError("Browser disconnected")
             self._queue.put_nowait(ctx)
             returned = True
         except BaseException:
             try:
-                await ctx.close()
+                await asyncio.wait_for(ctx.close(), timeout=2.0)
             except BaseException:
                 pass
         finally:
-            if not returned and self._browser is not None and self.available:
-                try:
-                    new_ctx = await self._browser.new_context()
-                    self._queue.put_nowait(new_ctx)
-                except BaseException:
-                    pass
+            if not returned and self._enabled and self.size > 0:
+                if self._browser is not None and self._browser.is_connected():
+                    try:
+                        new_ctx = await asyncio.wait_for(self._browser.new_context(), timeout=5.0)
+                        self._queue.put_nowait(new_ctx)
+                        returned = True
+                    except BaseException:
+                        pass
+                if not returned:
+                    try:
+                        await self._restart_browser()
+                    except BaseException:
+                        pass
 
 
 def build_targets(
@@ -313,6 +445,67 @@ def _is_bot_wall(status_code: int, final_url: str, text: str) -> bool:
     return any(phrase in visible for phrase in _BOT_WALL_PHRASES)
 
 
+def _build_pinned_request(url: str, validated_ip: str) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """Build an IP-pinned URL, Host header, and SNI extension when validated_ip is an IP literal."""
+    if not _is_ip_literal(validated_ip):
+        return url, {}, {}
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    ip_host = f"[{validated_ip}]" if ":" in validated_ip else validated_ip
+    netloc = f"{ip_host}:{parsed.port}" if parsed.port else ip_host
+    pinned_url = parsed._replace(netloc=netloc).geturl()
+    host_header = f"{host}:{parsed.port}" if parsed.port else host
+    return pinned_url, {"Host": host_header}, {"sni_hostname": host}
+
+
+async def _pinned_get(
+    client: httpx.AsyncClient,
+    url: str,
+    timeout: float = 1.5,
+    max_redirects: int = 3,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+) -> tuple[int, str, str, bool]:
+    """Fetch HTTPS URL with DNS-pinned IP, manual redirect re-validation, and byte cap.
+
+    Returns (status_code, final_url, text, ok). ok is False if redirects failed/exhausted.
+    """
+    current_url = url
+    for _ in range(max_redirects):
+        validated_ip = await validate_public_https_async(current_url, mock_fetch=False)
+        req_url, headers, extensions = _build_pinned_request(current_url, validated_ip)
+        async with client.stream(
+            "GET",
+            req_url,
+            headers=headers or None,
+            extensions=extensions or None,
+            follow_redirects=False,
+            timeout=timeout,
+        ) as resp:
+            if 300 <= resp.status_code < 400:
+                location = resp.headers.get("location")
+                if not location:
+                    return resp.status_code, current_url, "", False
+                current_url = urljoin(current_url, location)
+                continue
+
+            content_len = resp.headers.get("content-length")
+            if content_len and content_len.isdigit() and int(content_len) > max_bytes:
+                raise ValueError(f"Response Content-Length {content_len} exceeds {max_bytes} byte limit")
+
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Response exceeded {max_bytes} byte limit")
+                chunks.append(chunk)
+
+            encoding = resp.encoding or "utf-8"
+            text = b"".join(chunks).decode(encoding, errors="replace")
+            return resp.status_code, current_url, text, True
+    return 302, current_url, "", False
+
+
 async def discover_targets(
     intent: str,
     constraints: list[str],
@@ -337,10 +530,9 @@ async def discover_targets(
     reddit_url = f"https://old.reddit.com/search?q={quote_plus(query)}&sort=relevance"
 
     try:
-        await validate_public_https_async(ddg_url, mock_fetch=False)
-        resp = await client.get(ddg_url, timeout=1.5)
-        if not _is_bot_wall(resp.status_code, str(resp.url), resp.text):
-            soup = BeautifulSoup(resp.text, "html.parser")
+        status_code, final_url, body_text, ok = await _pinned_get(client, ddg_url, timeout=1.5)
+        if ok and not _is_bot_wall(status_code, final_url, body_text):
+            soup = BeautifulSoup(body_text, "html.parser")
             for anchor in soup.select("a.result__a, a.search-title"):
                 href = anchor.get("href")
                 if not href or not isinstance(href, str):
@@ -364,10 +556,9 @@ async def discover_targets(
 
     if len(targets) < 2:
         try:
-            await validate_public_https_async(reddit_url, mock_fetch=False)
-            resp = await client.get(reddit_url, timeout=1.5)
-            if not _is_bot_wall(resp.status_code, str(resp.url), resp.text):
-                soup = BeautifulSoup(resp.text, "html.parser")
+            status_code, final_url, body_text, ok = await _pinned_get(client, reddit_url, timeout=1.5)
+            if ok and not _is_bot_wall(status_code, final_url, body_text):
+                soup = BeautifulSoup(body_text, "html.parser")
                 for anchor in soup.select("a.search-title"):
                     href = anchor.get("href")
                     if not href or not isinstance(href, str):
@@ -384,6 +575,13 @@ async def discover_targets(
             pass
 
     return targets[:6]
+
+
+async def _safe_abort(route: Any) -> None:
+    try:
+        await route.abort()
+    except Exception:
+        pass
 
 
 async def fetch_url(
@@ -406,29 +604,15 @@ async def fetch_url(
             }
         return gatekeeper.inspect_and_sanitize_html(fixture["html"], source_url=url)
 
-    current_url = url
-    html = ""
-    status_code = 200
-    for _ in range(3):
-        await validate_public_https_async(current_url, mock_fetch=False)
-        resp = await client.get(current_url, follow_redirects=False, timeout=1.5)
-        if 300 <= resp.status_code < 400:
-            location = resp.headers.get("location")
-            if not location:
-                return gatekeeper.TaintedPayload(source_url=current_url, title="", text="")
-            current_url = urljoin(current_url, location)
-            continue
-        status_code = resp.status_code
-        html = resp.text
-        break
-    else:
+    status_code, current_url, html, ok = await _pinned_get(client, url, timeout=1.5)
+    if not ok:
         return gatekeeper.TaintedPayload(source_url=current_url, title="", text="")
 
     if _is_bot_wall(status_code, current_url, html):
         return gatekeeper.TaintedPayload(source_url=current_url, title="", text="")
 
     payload = gatekeeper.inspect_and_sanitize_html(html, source_url=current_url)
-    if len(payload.text) < 400 and pool is not None and pool.available:
+    if len(payload.text) < 400 and pool is not None and (pool.is_healthy() or pool._enabled):
         ctx = None
         try:
             await validate_public_https_async(current_url, mock_fetch=False)
@@ -444,17 +628,21 @@ async def fetch_url(
                         if 300 <= resp.status < 400:
                             location = resp.headers.get("location")
                             if not location:
-                                await route.abort()
+                                await _safe_abort(route)
                                 return
                             hop_url = urljoin(hop_url, location)
                             await validate_public_https_async(hop_url, mock_fetch=False)
                             resp = await route.fetch(url=hop_url, max_redirects=0)
                         else:
+                            body = await resp.body()
+                            if len(body) > MAX_RESPONSE_BYTES:
+                                await _safe_abort(route)
+                                return
                             await route.fulfill(response=resp)
                             return
-                    await route.abort()
+                    await _safe_abort(route)
                 except Exception:
-                    await route.abort()
+                    await _safe_abort(route)
 
             await page.route("**/*", _route_handler)
             await page.goto(current_url, timeout=5000, wait_until="domcontentloaded")
@@ -463,6 +651,8 @@ async def fetch_url(
             except ValueError:
                 return gatekeeper.TaintedPayload(source_url=current_url, title="", text="")
             rendered_html = await page.content()
+            if len(rendered_html.encode("utf-8", errors="ignore")) > MAX_RESPONSE_BYTES:
+                return gatekeeper.TaintedPayload(source_url=current_url, title="", text="")
             if _is_bot_wall(200, page.url, rendered_html):
                 return gatekeeper.TaintedPayload(source_url=current_url, title="", text="")
             payload = gatekeeper.inspect_and_sanitize_html(rendered_html, source_url=current_url)

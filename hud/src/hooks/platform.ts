@@ -5,17 +5,36 @@ export function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-export async function openExternal(url: string): Promise<void> {
-  if (!/^https?:\/\//i.test(url)) return;
+export function isSafeExternalUrl(u: unknown): u is string {
+  if (typeof u !== 'string' || u.length === 0) return false;
+  if (/[\s\u0000-\u001f\u007f]/.test(u)) return false;
+  try {
+    const parsed = new URL(u);
+    if (parsed.protocol !== 'https:') return false;
+    if (!parsed.hostname) return false;
+    if (parsed.username !== '' || parsed.password !== '') return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function openExternal(url: string): Promise<boolean> {
+  if (!isSafeExternalUrl(url)) return false;
   if (isTauri()) {
     try {
       await openUrl(url);
-      return;
+      return true;
     } catch {
-      /* fall through to window.open */
+      return false;
     }
   }
-  window.open(url, '_blank', 'noopener,noreferrer');
+  try {
+    const win = window.open(url, '_blank', 'noopener,noreferrer');
+    return win !== null;
+  } catch {
+    return false;
+  }
 }
 
 let simulated = 94;
@@ -32,11 +51,13 @@ export async function getHudMemoryMb(): Promise<number> {
   return Math.round(simulated * 10) / 10;
 }
 
-export function normalizeUrl(u: string): string {
+export function normalizeUrl(u: unknown = ''): string {
+  if (typeof u !== 'string') return '';
   return u.trim().replace(/\/+$/, '').replace(/^https?:\/\/(www\.)?/i, '').toLowerCase();
 }
 
-export function hostOf(u: string): string {
+export function hostOf(u: unknown = ''): string {
+  if (typeof u !== 'string') return '';
   try {
     return new URL(u).hostname.replace(/^www\./, '');
   } catch {

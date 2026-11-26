@@ -3,8 +3,10 @@ import type {
   CloudToClientMessage,
   ContradictionItem,
   EvidenceCard,
+  GatekeeperActionType,
   GatekeeperInterceptMessage,
   MindMapData,
+  PinnedNote,
   SynthesisItem,
   SynthesisUpdateMessage,
   TelemetryAgentId,
@@ -30,6 +32,8 @@ function readEnv(): EnvShape {
 
 const BACKOFF_START_MS = 1000;
 const BACKOFF_MAX_MS = 30000;
+const _MUTATING_KEYWORD_RE =
+  /\b(?:buy|purchase|checkout|place\s+(?:an\s+)?order|order\s+(?:it|this|that|one|now)|submit\s+(?:the\s+|a\s+)?(?:form|application|order)|post\s+(?:a\s+|the\s+)?(?:comment|reply|review)|publish|reply\s+to|comment\s+on)\b/i;
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -44,6 +48,9 @@ export class WsClient {
   private traceSeq = 0;
   private activeJobId = 'job_01';
   private mockTabs = 0;
+  private mockConstraints: string[] = [];
+  private mockContextUrl?: string;
+  private mockPinnedNotes: PinnedNote[] = [];
   private readonly mock: boolean;
   private readonly url: string;
 
@@ -116,6 +123,15 @@ export class WsClient {
     this.setStatus('DISCONNECTED');
   }
 
+  reset(): void {
+    this.clearMockTimers();
+    this.queue = [];
+    this.mockTabs = 0;
+    this.mockConstraints = [];
+    this.mockContextUrl = undefined;
+    this.mockPinnedNotes = [];
+  }
+
   send(msg: ClientToCloudMessage): void {
     if (this.mock) {
       this.handleMock(msg);
@@ -124,6 +140,11 @@ export class WsClient {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     } else {
+      if (msg.type === 'DISPATCH_SWARM') {
+        this.queue = this.queue.filter(
+          (queued) => queued.type !== 'DISPATCH_SWARM' && queued.type !== 'STEER_SWARM',
+        );
+      }
       this.queue.push(msg);
     }
   }
@@ -209,6 +230,7 @@ export class WsClient {
     latency_ms: number,
     workers_active: number,
     tabs_offloaded: number,
+    tier?: 1 | 2,
   ): TelemetryMessage {
     this.traceSeq += 1;
     return {
@@ -220,13 +242,20 @@ export class WsClient {
       latency_ms,
       workers_active,
       tabs_offloaded,
+      ...(tier !== undefined ? { tier } : {}),
     };
   }
 
   private handleMock(msg: ClientToCloudMessage): void {
     switch (msg.type) {
       case 'DISPATCH_SWARM':
-        this.mockDispatch(msg.job_id, msg.intent);
+        this.mockDispatch(
+          msg.job_id,
+          msg.intent,
+          msg.constraints ?? [],
+          msg.context_url,
+          msg.pinned_notes ?? [],
+        );
         break;
       case 'STEER_SWARM':
         this.mockSteer(msg.job_id, msg.delta_instruction, msg.cancel_domains ?? []);
@@ -250,40 +279,72 @@ export class WsClient {
     }
   }
 
-  private mockDispatch(jobId: string, intent: string): void {
+  private scheduleMockGate(triggerText: string): void {
+    const match = _MUTATING_KEYWORD_RE.exec(triggerText);
+    if (!match) return;
+    const kw = match[0].toLowerCase();
+    let actionType: GatekeeperActionType = 'FORM_SUBMIT';
+    if (kw.startsWith('buy') || kw.startsWith('purchase') || kw.startsWith('checkout') || kw.startsWith('place') || kw.startsWith('order')) {
+      actionType = 'CHECKOUT_CLICK';
+    } else if (kw.startsWith('post') || kw.startsWith('publish') || kw.startsWith('reply') || kw.startsWith('comment')) {
+      actionType = 'EXTERNAL_POST';
+    }
+    this.later(3600, () => {
+      this.emit(this.tele('gatekeeper', 'RUNNING', 'Cedar evaluating untrusted action from sanitized page', 60, 1, this.mockTabs));
+    });
+    this.later(4000, () => {
+      this.emit(this.tele('gatekeeper', 'BLOCKED', 'forbid_untrusted_mutating_action: awaiting signature', 75, 0, this.mockTabs));
+      this.emit(this.buildGate(actionType));
+    });
+  }
+
+  private mockDispatch(
+    jobId: string,
+    intent: string,
+    constraints: string[],
+    contextUrl: string | undefined,
+    pinnedNotes: PinnedNote[],
+  ): void {
     this.clearMockTimers();
     this.activeJobId = jobId;
     this.mockTabs = 0;
+    this.mockConstraints = constraints;
+    this.mockContextUrl = contextUrl;
+    this.mockPinnedNotes = pinnedNotes;
     const short = intent.length > 60 ? `${intent.slice(0, 57)}...` : intent;
 
     this.later(200, () => {
       this.mockTabs = 2;
-      this.emit(this.tele('scout_swarm', 'RUNNING', `Tier-1 fan-out started for "${short}"`, 120, 2, 2));
+      this.emit(this.tele('scout_swarm', 'RUNNING', `Tier-1 fan-out started for "${short}"`, 120, 2, 2, 1));
     });
     this.later(900, () => {
       this.mockTabs = 5;
       this.emit(
-        this.tele('scout_swarm', 'RUNNING', 'Tier-1 fetched 4 Reddit threads; escalating 1 JS page to warm Playwright', 420, 3, 5),
+        this.tele('scout_swarm', 'RUNNING', 'Tier-1 fetched 4 Reddit threads; escalating 1 JS page to warm Playwright', 420, 3, 5, 2),
       );
     });
     this.later(1700, () => {
       this.mockTabs = 7;
-      this.emit(this.tele('scout_swarm', 'COMPLETED', 'Scouts finished: 7 pages offloaded to AWS', 780, 0, 7));
+      this.emit(this.tele('scout_swarm', 'COMPLETED', 'Scouts finished: 7 pages offloaded to AWS', 780, 0, 7, 2));
     });
     this.later(1800, () => {
       this.emit(this.tele('synthesis', 'RUNNING', 'Reasoning model resolving cross-source conflicts', 950, 1, 7));
     });
     this.later(2800, () => {
-      this.emit(this.tele('synthesis', 'COMPLETED', 'Synthesis ready: 1 contradiction found', 1240, 0, 7));
-      this.emit(this.buildSynthesis(jobId, null, []));
+      const update = this.buildSynthesis(jobId, null, []);
+      this.emit(
+        this.tele(
+          'synthesis',
+          'COMPLETED',
+          `Synthesis ready: ${update.contradictions.length} contradiction(s) found`,
+          1240,
+          0,
+          7,
+        ),
+      );
+      this.emit(update);
     });
-    this.later(3600, () => {
-      this.emit(this.tele('gatekeeper', 'RUNNING', 'Cedar evaluating untrusted action from sanitized page', 60, 1, 7));
-    });
-    this.later(4000, () => {
-      this.emit(this.tele('gatekeeper', 'BLOCKED', 'forbid_untrusted_mutating_action: awaiting signature', 75, 0, 7));
-      this.emit(this.buildGate());
-    });
+    this.scheduleMockGate([intent, ...constraints].join(' '));
   }
 
   private mockSteer(jobId: string, delta: string, cancelDomains: string[]): void {
@@ -291,29 +352,33 @@ export class WsClient {
     this.activeJobId = jobId || this.activeJobId;
     const tabs = this.mockTabs;
     this.emit(
-      this.tele('scout_swarm', 'CANCELLED', `Barge-in: stale workers cancelled${cancelDomains.length ? ` (${cancelDomains.join(', ')})` : ''}`, 35, 0, tabs),
+      this.tele('scout_swarm', 'CANCELLED', `Barge-in: stale workers cancelled${cancelDomains.length ? ` (${cancelDomains.join(', ')})` : ''}`, 35, 0, tabs, 1),
     );
     this.later(400, () => {
       this.mockTabs = tabs + 2;
-      this.emit(this.tele('scout_swarm', 'RUNNING', `Re-dispatching scouts: ${delta}`, 180, 3, this.mockTabs));
+      this.emit(this.tele('scout_swarm', 'RUNNING', `Re-dispatching scouts: ${delta}`, 180, 3, this.mockTabs, 1));
     });
     this.later(1300, () => {
       this.mockTabs = tabs + 4;
-      this.emit(this.tele('scout_swarm', 'COMPLETED', 'Refined scouting complete', 620, 0, this.mockTabs));
+      this.emit(this.tele('scout_swarm', 'COMPLETED', 'Refined scouting complete', 620, 0, this.mockTabs, 2));
     });
     this.later(1500, () => {
       this.emit(this.tele('synthesis', 'RUNNING', 'Re-synthesizing with updated instruction', 700, 1, this.mockTabs));
     });
     this.later(2400, () => {
+      const update = this.buildSynthesis(this.activeJobId, delta, cancelDomains);
       this.emit(this.tele('synthesis', 'COMPLETED', 'Refined synthesis ready', 1010, 0, this.mockTabs));
-      this.emit(this.buildSynthesis(this.activeJobId, delta, cancelDomains));
+      this.emit(update);
     });
+    this.scheduleMockGate(delta);
   }
 
   private buildSynthesis(jobId: string, delta: string | null, cancelDomains: string[]): SynthesisUpdateMessage {
     const excluded = (url: string): boolean => cancelDomains.some((d) => d && url.includes(d));
     const dropSony = cancelDomains.some((d) => d.includes('sony')) || (delta !== null && /sony|xm5/i.test(delta));
-    const multipoint = delta !== null && /multipoint/i.test(delta);
+    const multipoint =
+      (delta !== null && /multipoint/i.test(delta)) ||
+      this.mockConstraints.some((c) => /multipoint/i.test(c));
 
     const allItems: SynthesisItem[] = [
       {
@@ -371,6 +436,20 @@ export class WsClient {
     ];
     let cards = allCards.filter((c) => !excluded(c.source_url));
     if (dropSony) cards = cards.filter((c) => !/sony/i.test(c.source_url));
+    if (this.mockContextUrl && /^https:\/\//i.test(this.mockContextUrl) && !excluded(this.mockContextUrl)) {
+      const ctxUrl = this.mockContextUrl;
+      if (!cards.some((c) => c.source_url === ctxUrl)) {
+        cards = [
+          {
+            source_url: ctxUrl,
+            title: 'Provided Context Source',
+            sanitized_excerpt: 'User-supplied context URL prioritized during comparison and verification.',
+            quote_to_highlight: 'User-supplied context URL',
+          },
+          ...cards,
+        ];
+      }
+    }
 
     const contradictions: ContradictionItem[] = [
       {
@@ -380,6 +459,14 @@ export class WsClient {
         quote_to_highlight: quote,
       },
     ];
+    for (const note of this.mockPinnedNotes) {
+      contradictions.push({
+        claim: 'Pinned note cross-check',
+        conflict: note.text,
+        source_url: note.source_url && /^https:\/\//i.test(note.source_url) ? note.source_url : '',
+        quote_to_highlight: note.text.slice(0, 90),
+      });
+    }
 
     const nodes: MindMapData['nodes'] = [
       { id: 'n1', label: 'ANC Headphones', source_url: '' },
@@ -400,14 +487,23 @@ export class WsClient {
     const ids = new Set(liveNodes.map((n) => n.id));
     const liveEdges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
 
+    const suffixParts: string[] = [];
+    if (this.mockConstraints.length > 0) {
+      suffixParts.push(`Constraints applied: ${this.mockConstraints.join(', ')}.`);
+    }
+    if (this.mockPinnedNotes.length > 0) {
+      suffixParts.push(`Incorporated ${this.mockPinnedNotes.length} pinned note(s).`);
+    }
+    const suffix = suffixParts.length ? ` ${suffixParts.join(' ')}` : '';
+
     let voice_brief: string;
     if (delta === null) {
       voice_brief =
-        'Two models look solid, but Model A has recent Reddit hinge complaints and its 30-hour battery claim is contradicted by user benchmarks. Want me to drop it?';
+        `Two models look solid, but Model A has recent Reddit hinge complaints and its 30-hour battery claim is contradicted by user benchmarks. Want me to drop it?${suffix}`;
     } else {
       voice_brief = `Updated for "${delta}". ${dropSony ? 'Dropped Sony XM5. ' : ''}${
         multipoint ? 'Model A and Model B both support multipoint Bluetooth; ' : ''
-      }Model B looks like the safest pick at ${items.find((i) => i.name === 'Model B')?.price ?? '₹24,500'}.`;
+      }Model B looks like the safest pick at ${items.find((i) => i.name === 'Model B')?.price ?? '₹24,500'}.${suffix}`;
     }
 
     return {
@@ -421,16 +517,19 @@ export class WsClient {
     };
   }
 
-  private buildGate(): GatekeeperInterceptMessage {
+  private buildGate(actionType: GatekeeperActionType = 'FORM_SUBMIT'): GatekeeperInterceptMessage {
     return {
       type: 'GATEKEEPER_INTERCEPT',
       gate_id: 'gate_99',
       decision: 'FORBID_UNTIL_SIGNED',
       cedar_rule: 'forbid_untrusted_mutating_action',
-      action_type: 'FORM_SUBMIT',
-      target_url: 'https://example.com/checkout',
-      reason: 'Untrusted web content attempted to trigger a state-changing form submission.',
-      action_diff: 'POST /checkout with user session',
+      action_type: actionType,
+      target_url:
+        this.mockContextUrl && /^https:\/\//i.test(this.mockContextUrl)
+          ? this.mockContextUrl
+          : 'https://example.com/checkout',
+      reason: 'Untrusted web content attempted to trigger a state-changing action.',
+      action_diff: actionType === 'EXTERNAL_POST' ? 'POST /post with user session' : 'POST /checkout with user session',
     };
   }
 }

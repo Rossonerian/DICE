@@ -51,7 +51,7 @@ class SteerSwarm(StrictModel):
 
 class ApprovalDecision(StrictModel):
     type: Literal["APPROVAL_DECISION"]
-    gate_id: str
+    gate_id: str = Field(min_length=1)
     approved: bool
 
 

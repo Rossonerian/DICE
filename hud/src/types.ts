@@ -47,6 +47,7 @@ export interface TelemetryMessage {
   latency_ms: number;
   workers_active: number;
   tabs_offloaded: number;
+  tier?: 1 | 2;
 }
 
 export interface SynthesisItem {

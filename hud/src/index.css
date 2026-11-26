@@ -2,29 +2,52 @@
 
 :root {
   color-scheme: dark;
+  --hud-surface: rgba(15, 23, 42, 0.72);
 }
 
-html,
-body,
-#root {
-  height: 100%;
-  margin: 0;
-  background: #0b0f17;
-  overflow: hidden;
-}
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    background: #0b0f17;
+    overflow: hidden;
+  }
 
-body {
-  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  color: #e5e7eb;
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    color: #e5e7eb;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #475569 #0f172a;
+  }
+
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+
+  :focus-visible {
+    outline: 2px solid #22d3ee;
+    outline-offset: 2px;
+  }
 }
 
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
+::-webkit-scrollbar-track {
+  background: #0f172a;
+}
 ::-webkit-scrollbar-thumb {
-  background: #334155;
+  background: #475569;
   border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
 }
 
 mark.spot {
@@ -33,12 +56,6 @@ mark.spot {
   padding: 0 3px;
   border-radius: 3px;
   box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.55), 0 0 18px 4px rgba(34, 211, 238, 0.55);
-  animation: spotPulse 1.4s ease-in-out infinite;
-}
-
-@keyframes spotPulse {
-  0%, 100% { box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.55), 0 0 10px 2px rgba(34, 211, 238, 0.4); }
-  50% { box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.9), 0 0 24px 7px rgba(34, 211, 238, 0.8); }
 }
 
 .card-spot {
@@ -46,40 +63,153 @@ mark.spot {
   box-shadow: 0 0 28px rgba(34, 211, 238, 0.35);
 }
 
+@keyframes spotPulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.55), 0 0 10px 2px rgba(34, 211, 238, 0.4); }
+  50% { box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.9), 0 0 24px 7px rgba(34, 211, 238, 0.8); }
+}
+
 @keyframes orbPulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.12); }
-}
-.orb-active {
-  animation: orbPulse 1.2s ease-in-out infinite;
 }
 
 @keyframes gateFlash {
   0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.8); }
   50% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
 }
-.gate-flash {
-  animation: gateFlash 1.3s infinite;
+
+@media (prefers-reduced-motion: no-preference) {
+  mark.spot {
+    animation: spotPulse 1.4s ease-in-out infinite;
+  }
+  .orb-active {
+    animation: orbPulse 1.2s ease-in-out infinite;
+  }
+  .gate-flash {
+    animation: gateFlash 1.3s infinite;
+  }
+}
+
+/* MindMap SVG tokens */
+.mm-edge-line {
+  stroke: #94a3b8;
+}
+.mm-edge-line--contra {
+  stroke: #f87171;
+}
+.mm-edge-label {
+  fill: #cbd5e1;
+}
+.mm-edge-label--contra {
+  fill: #fca5a5;
+}
+.mm-edge-pill {
+  fill: #0f172a;
+  stroke: #334155;
+}
+.mm-node-rect {
+  fill: #0f172a;
+  stroke: #64748b;
+}
+.mm-node-rect--clickable {
+  stroke: #fbbf24;
+}
+.mm-node-rect--hot {
+  fill: #164e63;
+  stroke: #22d3ee;
+}
+.mm-node-text {
+  fill: #f1f5f9;
+}
+.mm-node--clickable:hover .mm-node-rect,
+.mm-node--clickable:focus-visible .mm-node-rect {
+  filter: brightness(1.25);
+  stroke-width: 2.5;
 }
 
 /* Narrated / High-Contrast mode */
+.hc {
+  --hud-surface: #000000;
+  color: #fff;
+}
 .hc,
 .hc body {
   background: #000;
 }
+/* Scale body text without changing root html rem so w-72 / spacing stay stable */
+.hc body {
+  font-size: 1.0625rem;
+}
+.hc * {
+  scrollbar-color: #fff #000;
+}
+.hc ::-webkit-scrollbar-track {
+  background: #000;
+}
+.hc ::-webkit-scrollbar-thumb {
+  background: #fff;
+  border: 1px solid #000;
+}
+.hc :focus-visible {
+  outline: 2px solid #ffff00;
+  outline-offset: 2px;
+}
 .hc .panel {
   background: #000 !important;
-  border-color: #fff !important;
   color: #fff !important;
+  border-width: 2px;
+}
+.hc .panel:not(.panel-semantic) {
+  border-color: #fff !important;
+}
+.hc .panel-cyan {
+  border-color: #22d3ee !important;
+}
+.hc .panel-emerald {
+  border-color: #34d399 !important;
+}
+.hc .panel-red {
+  border-color: #f87171 !important;
+}
+.hc .card-spot {
+  border-color: #ffff00 !important;
+  outline: 3px solid #ffff00;
+  box-shadow: 0 0 24px rgba(255, 255, 0, 0.45);
 }
 .hc .muted {
   color: #e5e7eb !important;
 }
-.hc {
-  font-size: 1.08rem;
-  color: #fff;
-}
 .hc mark.spot {
   background: #ffff00;
   color: #000;
+}
+.hc .mm-edge-line {
+  stroke: #ffffff;
+}
+.hc .mm-edge-line--contra {
+  stroke: #ff6b6b;
+}
+.hc .mm-edge-label {
+  fill: #ffffff;
+}
+.hc .mm-edge-label--contra {
+  fill: #ff8787;
+}
+.hc .mm-edge-pill {
+  fill: #000000;
+  stroke: #ffffff;
+}
+.hc .mm-node-rect {
+  fill: #000000;
+  stroke: #ffffff;
+}
+.hc .mm-node-rect--clickable {
+  stroke: #fbbf24;
+}
+.hc .mm-node-rect--hot {
+  fill: #000000;
+  stroke: #ffff00;
+}
+.hc .mm-node-text {
+  fill: #ffffff;
 }

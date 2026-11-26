@@ -1,5 +1,5 @@
 use tauri::Manager;
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 #[tauri::command]
 fn get_hud_memory_mb() -> f64 {
@@ -27,8 +27,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcut(hotkey)
-                .expect("failed to register Alt+Space")
                 .with_handler(|app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
                         if let Some(win) = app.get_webview_window("main") {
@@ -46,6 +44,12 @@ pub fn run() {
                 })
                 .build(),
         )
+        .setup(move |app| {
+            if let Err(e) = app.global_shortcut().register(hotkey) {
+                eprintln!("[DICE] Alt+Space shortcut unavailable ({e}); HUD still runs, use the window directly.");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![get_hud_memory_mb])
         .run(tauri::generate_context!())
         .expect("error while running DICE HUD");

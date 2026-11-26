@@ -893,6 +893,285 @@ def main_tests() -> int:
 
         results.append(run_case("23. synthesis._neutralize strips tags", case_23))
 
+        # 24. P0-3a: STEER blocks stale gen-1 frames & DISPATCH supersedes prior job_id
+        def case_24() -> None:
+            orig_synth = synthesis.synthesize
+
+            async def slow_gen1_synth(
+                job_id: str,
+                intent: str,
+                constraints: list[str],
+                chunks: list[gatekeeper.TaintedPayload],
+                pinned_notes: list[schemas.PinnedNote] | None = None,
+                mock_bedrock: bool = False,
+                generation_id: int = 0,
+                context_url: str | None = None,
+            ) -> schemas.SynthesisUpdate:
+                if generation_id == 1:
+                    await asyncio.sleep(0.25)
+                    return schemas.SynthesisUpdate(
+                        job_id=job_id,
+                        voice_brief="STALE_GEN_1",
+                    )
+                return await orig_synth(
+                    job_id=job_id,
+                    intent=intent,
+                    constraints=constraints,
+                    chunks=chunks,
+                    pinned_notes=pinned_notes,
+                    mock_bedrock=mock_bedrock,
+                    generation_id=generation_id,
+                    context_url=context_url,
+                )
+
+            synthesis.synthesize = slow_gen1_synth
+            try:
+                with client.websocket_connect("/ws/test-p03a") as ws:
+                    reader = WsReader(ws)
+                    try:
+                        ws.send_json(
+                            {
+                                "type": "DISPATCH_SWARM",
+                                "job_id": "job-p03a-1",
+                                "intent": "compare laptops",
+                            }
+                        )
+                        running = reader.recv_until(
+                            lambda m: isinstance(m, schemas.Telemetry)
+                            and m.agent_id == "scout_swarm"
+                            and m.status == "RUNNING",
+                            timeout=5.0,
+                        )
+                        assert isinstance(running, schemas.Telemetry)
+                        assert running.workers_active > 0, running.workers_active
+
+                        reader.recv_until(
+                            lambda m: isinstance(m, schemas.Telemetry)
+                            and m.agent_id == "synthesis"
+                            and m.status == "RUNNING",
+                            timeout=5.0,
+                        )
+
+                        ws.send_json(
+                            {
+                                "type": "STEER_SWARM",
+                                "job_id": "job-p03a-1",
+                                "delta_instruction": "prioritize battery",
+                            }
+                        )
+                        reader.recv_until(
+                            lambda m: isinstance(m, schemas.Telemetry)
+                            and m.agent_id == "scout_swarm"
+                            and m.status == "CANCELLED",
+                            timeout=0.5,
+                        )
+                        reader.recv_until(
+                            lambda m: isinstance(m, schemas.Telemetry)
+                            and m.agent_id == "synthesis"
+                            and m.status == "CANCELLED",
+                            timeout=0.5,
+                        )
+                        upd = reader.recv_until(
+                            lambda m: isinstance(m, schemas.SynthesisUpdate),
+                            timeout=5.0,
+                        )
+                        assert isinstance(upd, schemas.SynthesisUpdate)
+                        assert upd.voice_brief != "STALE_GEN_1", upd.voice_brief
+
+                        try:
+                            leaked = reader.recv_until(
+                                lambda m: isinstance(m, schemas.SynthesisUpdate)
+                                and m.voice_brief == "STALE_GEN_1",
+                                timeout=0.35,
+                            )
+                            raise AssertionError(f"Leaked stale gen-1 update: {leaked}")
+                        except TimeoutError:
+                            pass
+                    finally:
+                        reader.close()
+
+                # Sub-check B: new job_id supersedes old pending-gate job
+                with client.websocket_connect("/ws/test-p03a-sup") as ws:
+                    reader = WsReader(ws)
+                    try:
+                        ws.send_json(
+                            {
+                                "type": "DISPATCH_SWARM",
+                                "job_id": "job-old",
+                                "intent": "buy laptop now",
+                            }
+                        )
+                        intercept = reader.recv_until(
+                            lambda m: isinstance(m, schemas.GatekeeperIntercept),
+                            timeout=5.0,
+                        )
+                        assert isinstance(intercept, schemas.GatekeeperIntercept)
+
+                        ws.send_json(
+                            {
+                                "type": "DISPATCH_SWARM",
+                                "job_id": "job-new",
+                                "intent": "compare laptops",
+                            }
+                        )
+                        reader.recv_until(
+                            lambda m: isinstance(m, schemas.SynthesisUpdate)
+                            and m.job_id == "job-new",
+                            timeout=5.0,
+                        )
+                        health_body = client.get("/health").json()
+                        assert health_body["active_jobs"] == 1, health_body
+
+                        ws.send_json(
+                            {
+                                "type": "APPROVAL_DECISION",
+                                "gate_id": intercept.gate_id,
+                                "approved": True,
+                            }
+                        )
+                        blk = reader.recv_until(
+                            lambda m: isinstance(m, schemas.Telemetry)
+                            and m.agent_id == "gatekeeper"
+                            and m.status == "BLOCKED"
+                            and "unknown or expired" in m.message,
+                            timeout=5.0,
+                        )
+                        assert isinstance(blk, schemas.Telemetry)
+                    finally:
+                        reader.close()
+            finally:
+                synthesis.synthesize = orig_synth
+
+        results.append(run_case("24. P0-3a steer gen guard & dispatch supersede", case_24))
+
+        # 25. P0-4: POST /sessions/{session_id}/reset & POST /reset
+        def case_25() -> None:
+            with client.websocket_connect("/ws/test-p04") as ws:
+                reader = WsReader(ws)
+                try:
+                    ws.send_json(
+                        {
+                            "type": "DISPATCH_SWARM",
+                            "job_id": "job-p04",
+                            "intent": "buy laptop now",
+                        }
+                    )
+                    intercept = reader.recv_until(
+                        lambda m: isinstance(m, schemas.GatekeeperIntercept),
+                        timeout=5.0,
+                    )
+                    assert isinstance(intercept, schemas.GatekeeperIntercept)
+                    assert client.get("/health").json()["active_jobs"] >= 1
+
+                    reset_resp = client.post("/sessions/test-p04/reset")
+                    assert reset_resp.status_code == 200, reset_resp.text
+                    assert reset_resp.json()["status"] == "reset", reset_resp.json()
+                    assert client.get("/health").json()["active_jobs"] == 0
+
+                    ws.send_json(
+                        {
+                            "type": "APPROVAL_DECISION",
+                            "gate_id": intercept.gate_id,
+                            "approved": True,
+                        }
+                    )
+                    blk = reader.recv_until(
+                        lambda m: isinstance(m, schemas.Telemetry)
+                        and m.agent_id == "gatekeeper"
+                        and m.status == "BLOCKED"
+                        and "unknown or expired" in m.message,
+                        timeout=5.0,
+                    )
+                    assert isinstance(blk, schemas.Telemetry)
+
+                    ws.send_json(
+                        {
+                            "type": "DISPATCH_SWARM",
+                            "job_id": "job-p04-after",
+                            "intent": "compare laptops",
+                        }
+                    )
+                    upd = reader.recv_until(
+                        lambda m: isinstance(m, schemas.SynthesisUpdate)
+                        and m.job_id == "job-p04-after",
+                        timeout=5.0,
+                    )
+                    assert isinstance(upd, schemas.SynthesisUpdate)
+                finally:
+                    reader.close()
+
+            global_reset = client.post("/reset")
+            assert global_reset.status_code == 200, global_reset.text
+            assert global_reset.json()["status"] == "reset"
+
+        results.append(run_case("25. P0-4 session reset endpoint", case_25))
+
+        # 26. P0-5: CORS allowlist & CSWSH WebSocket Origin check
+        def case_26() -> None:
+            ok_cors = client.get("/health", headers={"Origin": "http://localhost:1420"})
+            assert ok_cors.status_code == 200
+            assert ok_cors.headers.get("access-control-allow-origin") == "http://localhost:1420"
+
+            bad_cors = client.get("/health", headers={"Origin": "https://evil.example"})
+            assert bad_cors.status_code == 200
+            assert "access-control-allow-origin" not in bad_cors.headers
+
+            rejected = False
+            try:
+                with client.websocket_connect("/ws/test-p05-bad", headers={"origin": "https://evil.example"}):
+                    pass
+            except Exception as exc:
+                rejected = True
+                code = getattr(exc, "code", None)
+                if code is not None:
+                    assert code == 1008, f"Expected close code 1008, got {code}"
+            assert rejected, "Disallowed WebSocket Origin was not rejected"
+
+            with client.websocket_connect("/ws/test-p05-ok", headers={"origin": "http://localhost:1420"}) as ws:
+                reader = WsReader(ws)
+                try:
+                    ws.send_json({"type": "DISPATCH_SWARM", "job_id": "job-p05", "intent": "compare laptops"})
+                    upd = reader.recv_until(lambda m: isinstance(m, schemas.SynthesisUpdate), timeout=5.0)
+                    assert isinstance(upd, schemas.SynthesisUpdate)
+                finally:
+                    reader.close()
+
+        results.append(run_case("26. P0-5 CORS & CSWSH origin check", case_26))
+
+        # 27. P1-8 CSS sanitizer bypasses & P2-2 gatekeeper validation
+        def case_27() -> None:
+            bypass_html = (
+                "<div>"
+                "<span style='opacity: 0 !important'>imp0</span>"
+                "<span style='opacity: .0'>dot0</span>"
+                "<span style='font-size: 0.0px'>f00px</span>"
+                "<span style='font-size: 0pt'>f0pt</span>"
+                "<span style='visibility: collapse'>vcol</span>"
+                "<span style='display/*bypass*/:none'>csscom</span>"
+                "<span>visible text</span>"
+                "</div>"
+            )
+            cleaned = gatekeeper.sanitize_html(bypass_html)
+            assert "visible text" in cleaned, cleaned
+            for leak in ("imp0", "dot0", "f00px", "f0pt", "vcol", "csscom"):
+                assert leak not in cleaned, f"CSS bypass leaked {leak!r}: {cleaned!r}"
+
+            try:
+                schemas.parse_client_message({"type": "APPROVAL_DECISION", "gate_id": "", "approved": True})
+                raise AssertionError("Expected ValidationError for empty gate_id")
+            except ValidationError:
+                pass
+
+            reg = gatekeeper.GateRegistry()
+            assert reg.resolve("missing", True) is False
+            reg.create("g-1")
+            assert reg.resolve("g-1", True) is True
+            assert reg.resolve("g-1", True) is False
+            reg.cancel_all()
+            assert reg._decisions == {}
+
+        results.append(run_case("27. P1-8 CSS bypasses & P2-2 gate validation", case_27))
+
     return 0 if all(results) else 1
 
 
